@@ -46,6 +46,33 @@ except ImportError:
     print("ERROR: safetensors not installed. Run: pip install safetensors", file=sys.stderr)
     sys.exit(1)
 
+# PyTorch is used for bfloat16 support — numpy cannot handle bfloat16 natively.
+# The Phi-4-reasoning-vision model stores tensors in bfloat16.
+try:
+    import torch as _torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
+
+def _st_open(path):
+    """Open safetensors file. Use torch framework if available (handles bfloat16)."""
+    if _TORCH_AVAILABLE:
+        return safe_open(path, framework="pt")
+    return safe_open(path, framework="numpy")
+
+def _st_to_numpy(tensor, output_dtype: np.dtype) -> np.ndarray:
+    """Convert safetensors tensor to numpy array, handling bfloat16."""
+    if _TORCH_AVAILABLE:
+        # torch tensor — convert bfloat16 to float16/float32 before numpy()
+        if tensor.dtype == _torch.bfloat16:
+            tensor = tensor.to(_torch.float32)
+        arr = tensor.numpy()
+    else:
+        arr = tensor  # already numpy
+    if arr.dtype != output_dtype:
+        return arr.astype(output_dtype)
+    return arr
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GGUF Format Constants
@@ -87,6 +114,50 @@ class GGMLType:
 
 PHI4_VISION_PREFIX = "model.embed_tokens_extend.image_embed."
 PHI4_AUDIO_PREFIX  = "model.embed_tokens_extend.audio_embed."
+
+# ── Phi4ForCausalLMV (Phi-4-reasoning-vision) ──
+# Uses LLaVA-style architecture: separate vision_tower + mm_projector
+PHI4V_TOWER_PREFIX      = "model.vision_tower."
+PHI4V_PROJECTOR_PREFIX  = "model.mm_projector."
+
+# Encoder layer map (relative path after stripping tower prefix + inner sub-prefix)
+# Same GGUF names as Phi4MM — only source path differs
+PHI4V_ENCODER_LAYER_MAP = {
+    "self_attn.q_proj.weight":   "v.blk.{bid}.attn_q.weight",
+    "self_attn.q_proj.bias":     "v.blk.{bid}.attn_q.bias",
+    "self_attn.k_proj.weight":   "v.blk.{bid}.attn_k.weight",
+    "self_attn.k_proj.bias":     "v.blk.{bid}.attn_k.bias",
+    "self_attn.v_proj.weight":   "v.blk.{bid}.attn_v.weight",
+    "self_attn.v_proj.bias":     "v.blk.{bid}.attn_v.bias",
+    "self_attn.out_proj.weight": "v.blk.{bid}.attn_out.weight",
+    "self_attn.out_proj.bias":   "v.blk.{bid}.attn_out.bias",
+    "layer_norm1.weight":        "v.blk.{bid}.ln1.weight",
+    "layer_norm1.bias":          "v.blk.{bid}.ln1.bias",
+    "layer_norm2.weight":        "v.blk.{bid}.ln2.weight",
+    "layer_norm2.bias":          "v.blk.{bid}.ln2.bias",
+    "mlp.fc1.weight":            "v.blk.{bid}.ffn_up.weight",
+    "mlp.fc1.bias":              "v.blk.{bid}.ffn_up.bias",
+    "mlp.fc2.weight":            "v.blk.{bid}.ffn_down.weight",
+    "mlp.fc2.bias":              "v.blk.{bid}.ffn_down.bias",
+}
+
+PHI4V_EMBEDDING_MAP = {
+    "embeddings.patch_embedding.weight":      "v.patch_embd.weight",
+    "embeddings.patch_embedding.bias":        "v.patch_embd.bias",
+    "embeddings.position_embedding.weight":   "v.position_embd.weight",
+}
+
+PHI4V_POST_NORM_MAP = {
+    "post_layernorm.weight": "v.post_ln.weight",
+    "post_layernorm.bias":   "v.post_ln.bias",
+}
+
+PHI4V_PROJECTOR_MAP = {
+    "0.weight": "mm.0.weight",
+    "0.bias":   "mm.0.bias",
+    "2.weight": "mm.2.weight",
+    "2.bias":   "mm.2.bias",
+}
 
 # ── Vision: SigLIP-2 encoder (27 layers) ──
 
@@ -365,7 +436,7 @@ class GGUFWriter:
 # Config Extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_configs(model_dir: Path) -> tuple[dict, dict]:
+def get_configs(model_dir: Path, arch: str = "phi4mm") -> tuple[dict, dict]:
     """Extract vision and audio configs from Phi-4 config.json."""
     config_path = model_dir / "config.json"
     vision_cfg = DEFAULT_VISION_CONFIG.copy()
@@ -380,10 +451,38 @@ def get_configs(model_dir: Path) -> tuple[dict, dict]:
 
     embd = cfg.get("embd_layer", {})
 
-    # Vision
+    # Vision — Phi4MM path
     img_embd = embd.get("image_embd_layer", {})
     if crop_size := img_embd.get("crop_size"):
         vision_cfg["image_size"] = crop_size
+
+    # Phi4ForCausalLMV: vision_config sub-dict
+    # Config from Phi-4-reasoning-vision (siglip2_vision_model) contains:
+    #   hidden_size, intermediate_size, num_attention_heads, num_hidden_layers
+    # but NOT image_size or patch_size (NaFlex = variable resolution).
+    vision_config = cfg.get("vision_config", {})
+    if not img_embd and vision_config:
+        if img_size := vision_config.get("image_size"):
+            vision_cfg["image_size"] = img_size
+        if patch_size := vision_config.get("patch_size"):
+            vision_cfg["patch_size"] = patch_size
+        if num_layers := vision_config.get("num_hidden_layers"):
+            vision_cfg["num_hidden_layers"] = num_layers
+        if h_size := vision_config.get("hidden_size"):
+            vision_cfg["hidden_size"] = h_size
+        if int_size := vision_config.get("intermediate_size"):
+            vision_cfg["intermediate_size"] = int_size
+        if num_heads := vision_config.get("num_attention_heads"):
+            vision_cfg["num_attention_heads"] = num_heads
+
+    # Extract patch_size from mm_vision_tower name if not in vision_config
+    # e.g. "google/siglip2-so400m-patch16-naflex" → patch_size=16
+    if vision_cfg["patch_size"] == DEFAULT_VISION_CONFIG["patch_size"]:
+        mm_tower = cfg.get("mm_vision_tower", "")
+        import re as _re
+        m_ps = _re.search(r"patch(\d+)", mm_tower)
+        if m_ps:
+            vision_cfg["patch_size"] = int(m_ps.group(1))
 
     # The projection output dim matches the LLM hidden_size
     if hidden_size := cfg.get("hidden_size"):
@@ -447,49 +546,138 @@ def _map_audio_tensor(rel_name: str) -> str | None:
     return None
 
 
+def _detect_phi4v_inner_prefix(safetensor_files: list) -> str:
+    """Detect the sub-prefix within model.vision_tower.
+
+    Phi4ForCausalLMV (Phi-4-reasoning-vision) nests the SigLIP model as:
+      model.vision_tower        (= Siglip2VisionTower wrapper class)
+        .vision_tower           (= actual Siglip2VisionModel stored as self.vision_tower)
+          .vision_model.*       (= Siglip2VisionModel state dict keys)
+
+    So actual keys: model.vision_tower.vision_tower.vision_model.encoder.layers.0.*
+    Inner prefix:   "vision_tower.vision_model."
+
+    Older/alternate checkpoints may use "vision_model." directly (no double nesting).
+    Returns the detected inner prefix string.
+    """
+    for st_path in safetensor_files:
+        with _st_open(st_path) as st:
+            for key in st.keys():
+                if key.startswith(PHI4V_TOWER_PREFIX):
+                    rel = key[len(PHI4V_TOWER_PREFIX):]
+                    # Double-nested: model.vision_tower.vision_tower.vision_model.*
+                    if rel.startswith("vision_tower.vision_model.") or rel.startswith("vision_tower.encoder."):
+                        return "vision_tower.vision_model."
+                    # Single-nested: model.vision_tower.vision_model.*
+                    if rel.startswith("vision_model."):
+                        return "vision_model."
+                    # No wrapper: model.vision_tower.encoder.* / embeddings.* / post_layernorm.*
+                    if rel.startswith("encoder.") or rel.startswith("embeddings.") or rel.startswith("post_layernorm"):
+                        return ""
+    # Default: Phi4ForCausalLMV uses double-nesting via Siglip2VisionTower
+    return "vision_tower.vision_model."
+
+
+def _map_phi4v_tensor(rel: str, is_projector: bool = False) -> str | None:
+    """Map a Phi4ForCausalLMV tensor to GGUF name.
+    rel: path relative to tower prefix + inner sub-prefix (for vision)
+         OR path relative to PHI4V_PROJECTOR_PREFIX (for projector)
+    """
+    if is_projector:
+        return PHI4V_PROJECTOR_MAP.get(rel)
+
+    # Encoder block layers
+    m = re.match(r"encoder\.layers\.(\d+)\.(.+)", rel)
+    if m:
+        layer_idx, suffix = int(m.group(1)), m.group(2)
+        if suffix in PHI4V_ENCODER_LAYER_MAP:
+            return PHI4V_ENCODER_LAYER_MAP[suffix].format(bid=layer_idx)
+
+    if rel in PHI4V_EMBEDDING_MAP:
+        return PHI4V_EMBEDDING_MAP[rel]
+    if rel in PHI4V_POST_NORM_MAP:
+        return PHI4V_POST_NORM_MAP[rel]
+    return None
+
+
 def extract_tensors(
     safetensor_files: list[Path],
     include_vision: bool,
     include_audio: bool,
     output_dtype: np.dtype = np.float16,
+    arch: str = "phi4mm",
+    inner_prefix: str = "vision_model.",
+    vision_cfg: dict | None = None,
 ) -> tuple[dict[str, np.ndarray], dict[str, str], list[str]]:
     """Extract and rename modality tensors from Phi-4 safetensors."""
     tensors: dict[str, np.ndarray] = {}
     mapping_log: dict[str, str] = {}
     skipped: list[str] = []
 
+    _phi4v_full_tower = PHI4V_TOWER_PREFIX + inner_prefix
+    _vcfg = vision_cfg or {}
+    # Determine total encoder layers to know which to skip (last layer dropped per PR #20168)
+    _phi4v_num_layers = _vcfg.get("num_hidden_layers", 27) if arch == "phi4v" else 0
+    _phi4v_patch_size = _vcfg.get("patch_size", 16) if arch == "phi4v" else 16
+
     for st_path in safetensor_files:
         print(f"  📂 Scanning {st_path.name}...")
-        with safe_open(st_path, framework="numpy") as st:
+        with _st_open(st_path) as st:
             for key in st.keys():
                 gguf_name = None
 
-                # Vision
-                if include_vision and key.startswith(PHI4_VISION_PREFIX):
-                    rel = key[len(PHI4_VISION_PREFIX):]
-                    gguf_name = _map_vision_tensor(rel)
-                    if gguf_name is None:
-                        skipped.append(key)
-                        continue
-
-                # Audio
-                elif include_audio and key.startswith(PHI4_AUDIO_PREFIX):
-                    rel = key[len(PHI4_AUDIO_PREFIX):]
-                    gguf_name = _map_audio_tensor(rel)
-                    if gguf_name is None:
-                        skipped.append(key)
-                        continue
-
-                else:
-                    continue
-
-                tensor = st.get_tensor(key)
-                if tensor.dtype != output_dtype:
-                    # Keep conv weights in F32 for numerical stability
-                    if "conv" in gguf_name.lower() and output_dtype == np.float16:
-                        tensor = tensor.astype(np.float32)
+                if arch == "phi4v":
+                    # Phi4ForCausalLMV: vision tower + mm_projector
+                    if include_vision and key.startswith(_phi4v_full_tower):
+                        rel = key[len(_phi4v_full_tower):]
+                        # Skip last encoder layer — Phi-4 uses hidden_states[-2] (PR #20168)
+                        m_skip = re.match(r"encoder\.layers\.(\d+)\.", rel)
+                        if m_skip and int(m_skip.group(1)) >= _phi4v_num_layers - 1:
+                            skipped.append(key)
+                            continue
+                        # Skip post_layernorm and head (not used in Phi-4 mmproj)
+                        if "post_layernorm" in rel or ".head." in rel:
+                            skipped.append(key)
+                            continue
+                        gguf_name = _map_phi4v_tensor(rel, is_projector=False)
+                        if gguf_name is None:
+                            skipped.append(key)
+                            continue
+                    elif include_vision and key.startswith(PHI4V_PROJECTOR_PREFIX):
+                        rel = key[len(PHI4V_PROJECTOR_PREFIX):]
+                        gguf_name = _map_phi4v_tensor(rel, is_projector=True)
+                        if gguf_name is None:
+                            skipped.append(key)
+                            continue
                     else:
-                        tensor = tensor.astype(output_dtype)
+                        continue
+                else:
+                    # Phi4MMForCausalLM: embed_tokens_extend architecture
+                    if include_vision and key.startswith(PHI4_VISION_PREFIX):
+                        rel = key[len(PHI4_VISION_PREFIX):]
+                        gguf_name = _map_vision_tensor(rel)
+                        if gguf_name is None:
+                            skipped.append(key)
+                            continue
+                    elif include_audio and key.startswith(PHI4_AUDIO_PREFIX):
+                        rel = key[len(PHI4_AUDIO_PREFIX):]
+                        gguf_name = _map_audio_tensor(rel)
+                        if gguf_name is None:
+                            skipped.append(key)
+                            continue
+                    else:
+                        continue
+
+                # _st_to_numpy handles bfloat16 (torch) and dtype conversion
+                conv_dtype = np.float32 if "conv" in gguf_name.lower() else output_dtype
+                tensor = _st_to_numpy(st.get_tensor(key), conv_dtype)
+
+                # Phi4V patch embedding: reshape [D, C*P²] → [D, C, P, P] (PR #20168)
+                if arch == "phi4v" and gguf_name == "v.patch_embd.weight" and tensor.ndim == 2:
+                    d, cpq = tensor.shape
+                    p = _phi4v_patch_size
+                    c = cpq // (p * p)
+                    tensor = tensor.reshape(d, p, p, c).transpose(0, 3, 1, 2)  # [D,C,P,P]
 
                 tensors[gguf_name] = tensor
                 mapping_log[key] = gguf_name
@@ -500,6 +688,30 @@ def extract_tensors(
             print(f"      {s}")
         if len(skipped) > 8:
             print(f"      ... and {len(skipped) - 8} more")
+
+    # Diagnostic: if phi4v and 0 vision encoder tensors extracted, show actual key structure
+    if arch == "phi4v" and include_vision:
+        v_count = sum(1 for n in tensors if n.startswith("v.blk."))
+        if v_count == 0:
+            print(f"\n  ⚠️  DIAGNOSTIC: 0 vision encoder tensors extracted for phi4v arch!")
+            print(f"      Expected prefix: '{_phi4v_full_tower}'")
+            print(f"      Scanning safetensors for actual keys under model.vision_tower.*...")
+            samples = []
+            for st_path in safetensor_files[:2]:
+                with _st_open(st_path) as st:
+                    for key in st.keys():
+                        if "vision_tower" in key or "vision_model" in key:
+                            samples.append(key)
+                            if len(samples) >= 15:
+                                break
+                if len(samples) >= 15:
+                    break
+            if samples:
+                print(f"      First {len(samples)} matching keys:")
+                for s in samples:
+                    print(f"        {s}")
+            else:
+                print(f"      No keys containing 'vision_tower' or 'vision_model' found!")
 
     return tensors, mapping_log, skipped
 
@@ -576,20 +788,50 @@ def show_menu(has_vision: bool, has_audio: bool) -> str:
             print("  ❌ Invalid selection. Enter 1, 2, or 3.")
 
 
-def detect_modalities(safetensor_files: list[Path]) -> tuple[bool, bool]:
-    """Quick check for presence of vision/audio tensors."""
+def detect_modalities(safetensor_files: list[Path]) -> tuple[bool, bool, str]:
+    """Quick check for presence of vision/audio tensors.
+    Returns (has_vision, has_audio, arch) where arch is 'phi4mm', 'phi4v', or 'unknown'.
+    """
     has_vision = False
     has_audio = False
+    arch = "unknown"
+    prefix_samples: set[str] = set()
+
     for st_path in safetensor_files:
-        with safe_open(st_path, framework="numpy") as st:
+        with _st_open(st_path) as st:
             for key in st.keys():
+                # Collect first 4 path components for diagnostics
+                parts = key.split(".")
+                prefix_samples.add(".".join(parts[:min(4, len(parts))]))
+
                 if key.startswith(PHI4_VISION_PREFIX):
                     has_vision = True
+                    arch = "phi4mm"
                 elif key.startswith(PHI4_AUDIO_PREFIX):
                     has_audio = True
+                    if arch == "unknown":
+                        arch = "phi4mm"
+                elif key.startswith(PHI4V_TOWER_PREFIX) or key.startswith(PHI4V_PROJECTOR_PREFIX):
+                    has_vision = True
+                    arch = "phi4v"
+
                 if has_vision and has_audio:
-                    return True, True
-    return has_vision, has_audio
+                    return True, True, arch
+
+    if not has_vision and not has_audio:
+        print()
+        print("  ⚠️  Known prefixes not found. Tensor prefixes actually present:")
+        top_prefixes: dict[str, int] = {}
+        for p in prefix_samples:
+            top = ".".join(p.split(".")[:2])
+            top_prefixes[top] = top_prefixes.get(top, 0) + 1
+        for p, count in sorted(top_prefixes.items(), key=lambda x: -x[1])[:20]:
+            print(f"      {p}  ({count} tensors)")
+        print(f"  Expected vision prefix: '{PHI4_VISION_PREFIX}' (Phi4MM)")
+        print(f"  Expected vision prefix: '{PHI4V_TOWER_PREFIX}' (Phi4V)")
+        print(f"  Expected audio prefix:  '{PHI4_AUDIO_PREFIX}'")
+
+    return has_vision, has_audio, arch
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -739,7 +981,14 @@ Examples:
 
     # 2. Detect available modalities
     print("  🔍 Detecting modalities...")
-    has_vision, has_audio = detect_modalities(st_files)
+    has_vision, has_audio, arch = detect_modalities(st_files)
+    if arch == "phi4v":
+        inner_prefix = _detect_phi4v_inner_prefix(st_files)
+        print(f"  🏗️  Architecture: Phi4ForCausalLMV (vision_tower, inner: '{inner_prefix or 'none'}')")
+    else:
+        inner_prefix = "vision_model."
+        if arch == "phi4mm":
+            print(f"  🏗️  Architecture: Phi4MMForCausalLM (embed_tokens_extend)")
     print(f"  {'✅' if has_vision else '❌'} Vision tensors {'found' if has_vision else 'NOT found'}")
     print(f"  {'✅' if has_audio else '❌'} Audio tensors {'found' if has_audio else 'NOT found'}")
 
@@ -757,8 +1006,15 @@ Examples:
             print(f"❌ Audio mode requested but no audio tensors found", file=sys.stderr)
             sys.exit(1)
         if mode == "omni" and not (has_vision and has_audio):
-            print(f"❌ Omni mode requires both vision and audio tensors", file=sys.stderr)
-            sys.exit(1)
+            if has_vision and not has_audio:
+                print("⚠️  No audio tensors found (vision-only model) — falling back to vision mode.")
+                mode = "vision"
+            elif has_audio and not has_vision:
+                print("⚠️  No vision tensors found — falling back to audio mode.")
+                mode = "audio"
+            else:
+                print(f"❌ Omni mode requires both vision and audio tensors", file=sys.stderr)
+                sys.exit(1)
     else:
         mode = show_menu(has_vision, has_audio)
 
@@ -776,7 +1032,7 @@ Examples:
     print(f"  Output:   {output_path}")
 
     # 4. Get configs
-    vision_cfg, audio_cfg = get_configs(model_dir)
+    vision_cfg, audio_cfg = get_configs(model_dir, arch=arch)
     if include_vision:
         print(f"  Vision:   {vision_cfg['num_hidden_layers']} SigLIP layers, "
               f"{vision_cfg['image_size']}px, patch={vision_cfg['patch_size']}")
@@ -787,7 +1043,8 @@ Examples:
     # 5. Extract tensors
     print(f"\n🔍 Extracting {mode} tensors...")
     tensors, mapping_log, skipped = extract_tensors(
-        st_files, include_vision, include_audio, output_dtype
+        st_files, include_vision, include_audio, output_dtype,
+        arch=arch, inner_prefix=inner_prefix, vision_cfg=vision_cfg,
     )
 
     if not tensors:
@@ -821,7 +1078,11 @@ Examples:
     writer.add_bool("clip.has_audio_encoder", include_audio)
 
     if include_vision:
-        writer.add_string("clip.projector_type", "mlp")
+        # Phi4ForCausalLMV uses projector_type "phi4" (MLP2x_GELU) per llama.cpp PR #20168
+        _proj_type = "phi4" if arch == "phi4v" else "mlp"
+        writer.add_string("clip.projector_type", _proj_type)
+        if arch == "phi4v":
+            writer.add_bool("clip.use_gelu", True)
         writer.add_uint32("clip.vision.image_size", vision_cfg["image_size"])
         writer.add_uint32("clip.vision.patch_size", vision_cfg["patch_size"])
         writer.add_uint32("clip.vision.embedding_length", vision_cfg["hidden_size"])
